@@ -1,0 +1,1568 @@
+<?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of composer/satis.
+ *
+ * (c) Composer <https://github.com/composer>
+ *
+ * For the full copyright and license information, please view
+ * the LICENSE file that was distributed with this source code.
+ */
+
+namespace Composer\Satis\PackageSelection;
+
+use Composer\Config;
+use Composer\Factory;
+use Composer\IO\NullIO;
+use Composer\Package\CompletePackage;
+use Composer\Package\Link;
+use Composer\Package\Package;
+use Composer\Repository\ArrayRepository;
+use Composer\Repository\ConfigurableRepositoryInterface;
+use Composer\Repository\PackageRepository;
+use Composer\Repository\RepositorySet;
+use Composer\Semver\Constraint\Constraint;
+use Composer\Semver\Constraint\MatchAllConstraint;
+use Composer\Util\Filesystem;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\TestCase;
+use Symfony\Component\Console\Output\NullOutput;
+
+/**
+ * @author James Hautot <james@rezo.net>
+ */
+class PackageSelectionTest extends TestCase
+{
+    private const REPOSITORY_TYPE_ARTIFACT = 'artifact';
+    private const REPOSITORY_TYPE_PATH = 'path';
+    private const REPOSITORY_TYPE_PACKAGE = 'package';
+
+    /** Version declared by the local repository fixtures. */
+    private const FIXTURE_VERSION = '1.0.0';
+
+    /** Same version as {@see self::FIXTURE_VERSION}, as Composer normalizes it. */
+    private const FIXTURE_NORMALIZED_VERSION = '1.0.0.0';
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataGetPackages(): array
+    {
+        $emptyRepo = new ArrayRepository();
+        $vendorRepo = new ArrayRepository();
+        $vendorRepo2 = new ArrayRepository();
+
+        $package = new Package('vendor/name', '1.0.0.0', '1.0');
+        $package2 = new Package('vendor2/name', '1.0.0.0', '1.0');
+        $package3 = new Package('vendor2/name2', '1.0.0.0', '1.0');
+        $vendorRepo->addPackage($package);
+        $vendorRepo2->addPackage($package2);
+        $vendorRepo2->addPackage($package3);
+
+        $data = [];
+
+        $data['empty repository'] = [
+            [],
+            [],
+            $emptyRepo,
+        ];
+
+        $data['empty repository with filter'] = [
+            [],
+            ['vendor/name'],
+            $emptyRepo,
+        ];
+
+        $data['repository with one package'] = [
+            [$package],
+            [],
+            $vendorRepo,
+        ];
+
+        $data['repository with one package and filter'] = [
+            [],
+            ['othervendor/othername'],
+            $vendorRepo,
+        ];
+
+        $data['repository with two packages'] = [
+            [$package2, $package3],
+            [],
+            $vendorRepo2,
+        ];
+
+        $data['repository with two packages and filter'] = [
+            [$package2],
+            ['vendor2/name'],
+            $vendorRepo2,
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     * @param string[] $filter
+     */
+    #[DataProvider('dataGetPackages')]
+    public function testGetPackages(array $expected, array $filter, ArrayRepository $repository): void
+    {
+        $builder = new PackageSelection(new NullOutput(), 'build', [], false);
+        if (count($filter) > 0) {
+            $builder->setPackagesFilter($filter);
+        }
+
+        $reflection = new \ReflectionClass(get_class($builder));
+        $method = $reflection->getMethod('getPackages');
+
+        self::assertSame($expected, $method->invokeArgs($builder, [$repository]));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataGetRequired(): array
+    {
+        $package = new Package('vendor/name', '1.0.0.0', '1.0');
+        $link = new Link('test', 'name', new MatchAllConstraint());
+        $devLink = new Link('devTest', 'name', new MatchAllConstraint());
+        $package->setRequires([$link->getTarget() => $link]);
+        $package->setDevRequires([$devLink->getTarget() => $devLink]);
+
+        $data = [];
+
+        $data['both require false'] = [
+            [],
+            $package,
+            false,
+            false,
+        ];
+
+        $data['require true'] = [
+            [$link->getTarget() => $link],
+            $package,
+            true,
+            false,
+        ];
+
+        $data['requireDev true'] = [
+            [$devLink->getTarget() => $devLink],
+            $package,
+            false,
+            true,
+        ];
+
+        $data['both require true'] = [
+            [$link->getTarget() => $link, $devLink->getTarget() => $devLink],
+            $package,
+            true,
+            true,
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     */
+    #[DataProvider('dataGetRequired')]
+    public function testGetRequired(array $expected, Package $package, bool $requireDependencies, bool $requireDevDependencies): void
+    {
+        $builder = new PackageSelection(new NullOutput(), 'build', [], false);
+
+        $reflection = new \ReflectionClass(get_class($builder));
+        $method = $reflection->getMethod('getRequired');
+
+        $property = $reflection->getProperty('requireDependencies');
+        $property->setValue($builder, $requireDependencies);
+
+        $property = $reflection->getProperty('requireDevDependencies');
+        $property->setValue($builder, $requireDevDependencies);
+
+        self::assertSame($expected, $method->invokeArgs($builder, [$package, true]));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataSetSelectedAsAbandoned(): array
+    {
+        $package = new CompletePackage('vendor/name', '1.0.0.0', '1.0');
+        $packageAbandoned1 = new CompletePackage('vendor/name', '1.0.0.0', '1.0');
+        $packageAbandoned1->setAbandoned(true);
+        $packageAbandoned2 = new CompletePackage('vendor/name', '1.0.0.0', '1.0');
+        $packageAbandoned2->setAbandoned('othervendor/othername');
+
+        $data = [];
+
+        $data['Nothing Abandoned'] = [
+            [$package->getUniqueName() => $package],
+            [],
+        ];
+
+        $data['Package Abandoned without Replacement'] = [
+            [$package->getUniqueName() => $packageAbandoned1],
+            ['vendor/name' => true],
+        ];
+
+        $data['Package Abandoned with Replacement'] = [
+            [$package->getUniqueName() => $packageAbandoned2],
+            ['vendor/name' => 'othervendor/othername'],
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     * @param array<string, mixed> $config
+     */
+    #[DataProvider('dataSetSelectedAsAbandoned')]
+    public function testSetSelectedAsAbandoned(array $expected, array $config): void
+    {
+        $package = new CompletePackage('vendor/name', '1.0.0.0', '1.0');
+
+        $builder = new PackageSelection(new NullOutput(), 'build', [
+            'abandoned' => $config,
+        ], false);
+
+        $reflection = new \ReflectionClass(get_class($builder));
+        $method = $reflection->getMethod('setSelectedAsAbandoned');
+
+        $property = $reflection->getProperty('selected');
+        $property->setValue($builder, [$package->getUniqueName() => $package]);
+
+        $method->invokeArgs($builder, []);
+
+        self::assertEquals($expected, $property->getValue($builder));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataPruneBlacklisted(): array
+    {
+        $package0 = new Package('vendor/name', '1.0.0.0', '1.0');
+        $package1 = new Package('vendor/name', '1.1.0.0', '1.1');
+        $package2 = new Package('vendor/name', '1.2.0.0', '1.2');
+        $packageOther = new Package('vendor/other', '1.0.0.0', '1.0');
+        $packageReplacing = new Package('vendor/replacer', '1.0.0.0', '1.0');
+        $packageReplacing->setReplaces([
+            'vendor/replaced' => new Link('vendor/replacer', 'vendor/replaced', new Constraint('==', '1.0.0.0'), Link::TYPE_REPLACE, '1.0'),
+        ]);
+
+        $data = [];
+        $selected = [$package0, $package1, $package2, $packageOther];
+
+        $data['Blacklist Whole Project'] = [
+            [$packageOther],
+            $selected,
+            ['vendor/name' => '*'],
+        ];
+
+        $data['Blacklist One Package'] = [
+            [$package0, $package2, $packageOther],
+            $selected,
+            ['vendor/name' => '1.1'],
+        ];
+
+        $data['Blacklist Newer Packages'] = [
+            [$package0, $package1, $packageOther],
+            $selected,
+            ['vendor/name' => '>1.1'],
+        ];
+
+        $data['Blacklist Replaced Package'] = [
+            [$packageOther],
+            [$packageReplacing, $packageOther],
+            ['vendor/replaced' => '*'],
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     * @param string[] $selected
+     * @param array<string, mixed> $config
+     */
+    #[DataProvider('dataPruneBlacklisted')]
+    public function testPruneBlacklisted(array $expected, array $selected, array $config): void
+    {
+        $builder = new PackageSelection(new NullOutput(), 'build', [
+            'blacklist' => $config,
+        ], false);
+        $reflection = new \ReflectionClass(get_class($builder));
+
+        $property = $reflection->getProperty('selected');
+        $property->setValue($builder, $selected);
+
+        $method = $reflection->getMethod('pruneBlacklisted');
+        $method->invokeArgs($builder, [false]);
+
+        self::assertEquals(array_values($expected), array_values($property->getValue($builder)));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataSelect(): array
+    {
+        $packages = [
+            'alpha' => [
+                'name' => 'vendor/project-alpha',
+                'version' => '1.2.3.0',
+            ],
+            'alpha-dev' => [
+                'name' => 'vendor/project-alpha',
+                'version' => '1.2.3.1-dev',
+            ],
+            'beta' => [
+                'name' => 'vendor/project-beta',
+                'version' => '1.2.3.0',
+                'type' => 'library',
+            ],
+            'beta-dev' => [
+                'name' => 'vendor/project-beta',
+                'version' => '1.2.3.1-dev',
+                'type' => 'library',
+            ],
+            'gamma1' => [
+                'name' => 'vendor/project-gamma',
+                'version' => '1.2.3.0',
+                'type' => 'project',
+            ],
+            'gamma2' => [
+                'name' => 'vendor/project-gamma',
+                'version' => '2.3.4.0',
+                'type' => 'project',
+            ],
+            'gamma3' => [
+                'name' => 'vendor/project-gamma',
+                'version' => '3.4.5.0',
+                'type' => 'library',
+            ],
+            'gamma4' => [
+                'name' => 'vendor/project-gamma',
+                'version' => '4.5.6.0',
+                'type' => 'library',
+            ],
+            'delta' => [
+                'name' => 'vendor/project-delta',
+                'version' => '1.2.3.0',
+                'type' => 'project',
+                'require' => [
+                    'vendor/project-alpha' => '^1',
+                    'vendor/project-gamma' => '^1',
+                ],
+            ],
+            'epsilon' => [
+                'name' => 'vendor/project-epsilon',
+                'version' => '1.2.3.0',
+                'type' => 'custom-type',
+                'require' => [
+                    'vendor/project-alpha' => '^1',
+                ],
+                'require-dev' => [
+                    'vendor/project-gamma' => '^4',
+                ],
+            ],
+            'zeta' => [
+                'name' => 'vendor/project-zeta',
+                'version' => '1.2.3.0',
+                'type' => 'another-custom-type',
+                'require' => [
+                    'vendor/project-epsilon' => '^1',
+                ],
+            ],
+            'eta' => [
+                'name' => 'vendor/project-eta',
+                'version' => '1.2.3.0',
+                'type' => 'another-custom-type',
+                'require' => [
+                    'vendor/project-gamma' => '>=1',
+                ],
+            ],
+        ];
+
+        $repo = [];
+        $repo['alpha'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-alpha',
+            'package' => [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+            ],
+        ];
+        $repo['beta'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-beta',
+            'package' => [
+                $packages['beta'],
+                $packages['beta-dev'],
+            ],
+        ];
+        $repo['gamma'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-gamma',
+            'package' => [
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+        ];
+        $repo['delta'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-delta',
+            'package' => $packages['delta'],
+        ];
+        $repo['epsilon'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-epsilon',
+            'package' => [
+                $packages['epsilon'],
+            ],
+        ];
+        $repo['zeta'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-zeta',
+            'package' => [
+                $packages['zeta'],
+            ],
+        ];
+        $repo['eta'] = [
+            'type' => 'package',
+            'url' => 'example.org/project-eta',
+            'package' => [
+                $packages['eta'],
+            ],
+        ];
+
+        foreach ($packages as &$p) {
+            $p = $p['name'] . '-' . $p['version'];
+        }
+
+        $data = [];
+
+        $data['Require-all'] = [
+            $packages,
+            [
+                'repositories' => array_values($repo),
+            ],
+        ];
+
+        $data['Require'] = [
+            [
+                $packages['alpha'],
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-alpha' => '>=1',
+                    'vendor/project-gamma' => '>=1',
+                ],
+            ],
+        ];
+
+        $data['Require dependencies'] = [
+            [
+                $packages['delta'],
+                $packages['alpha'],
+                $packages['gamma1'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-delta' => '>=1',
+                ],
+                'require-dependencies' => true,
+            ],
+        ];
+
+        $data['Require dependencies and dev-dependencies'] = [
+            [
+                $packages['epsilon'],
+                $packages['alpha'],
+                $packages['gamma4'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-epsilon' => '>=1',
+                ],
+                'require-dependencies' => true,
+                'require-dev-dependencies' => true,
+            ],
+        ];
+
+        $data['Require only dependencies'] = [
+            [
+                $packages['alpha'],
+                $packages['epsilon'],
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-epsilon' => '*',
+                    'vendor/project-zeta' => '*',
+                    'vendor/project-eta' => '*',
+                ],
+                'require-dependencies' => true,
+                'require-dev-dependencies' => true,
+                'only-dependencies' => true,
+            ],
+        ];
+
+        $data['Traverse dependencies but not dev-dependencies'] = [
+            [
+                $packages['zeta'],
+                $packages['epsilon'],
+                $packages['alpha'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-zeta' => '>=1',
+                ],
+                'require-dependencies' => true,
+                'require-dev-dependencies' => true,
+            ],
+        ];
+
+        $data['Reduce required dependencies'] = [
+            [
+                $packages['eta'],
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-eta' => '>=1',
+                ],
+                'require-dependencies' => true,
+            ],
+        ];
+
+        $data['Load from repositories-dep'] = [
+            [
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+                $packages['delta'],
+                $packages['alpha'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'repositories' => [
+                    $repo['gamma'],
+                    $repo['delta'],
+                ],
+                'repositories-dep' => array_values($repo),
+                'require-dependencies' => true,
+            ],
+        ];
+
+        $data['Set minimum-stability for a specific package'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['beta'],
+            ],
+            [
+                'minimum-stability' => 'stable',
+                'minimum-stability-per-package' => [
+                    'vendor/project-alpha' => 'dev',
+                ],
+                'repositories' => array_values($repo),
+                'require' => [
+                    'vendor/project-alpha' => '*',
+                    'vendor/project-beta' => '*',
+                ],
+            ],
+        ];
+
+        $data['Filter just libraries'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['beta'],
+                $packages['beta-dev'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+            [
+                'include-types' => [
+                    'library',
+                ],
+                'repositories' => array_values($repo),
+            ],
+        ];
+
+        $data['Filter just libraries and projects'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['beta'],
+                $packages['beta-dev'],
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+                $packages['delta'],
+            ],
+            [
+                'include-types' => [
+                    'library',
+                    'project',
+                ],
+                'repositories' => array_values($repo),
+            ],
+        ];
+
+        $data['Filter exclude projects'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['beta'],
+                $packages['beta-dev'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+                $packages['epsilon'],
+                $packages['zeta'],
+                $packages['eta'],
+            ],
+            [
+                'exclude-types' => [
+                    'project',
+                ],
+                'repositories' => array_values($repo),
+            ],
+        ];
+
+        $data['Filter exclude projects, custom'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['beta'],
+                $packages['beta-dev'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+                $packages['zeta'],
+                $packages['eta'],
+            ],
+            [
+                'exclude-types' => [
+                    'project',
+                    'custom-type',
+                ],
+                'repositories' => array_values($repo),
+            ],
+        ];
+
+        $data['Filter by one repository'] = [
+            [
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            ['example.org/project-gamma'],
+        ];
+
+        $data['Filter by two repositories'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['gamma1'],
+                $packages['gamma2'],
+                $packages['gamma3'],
+                $packages['gamma4'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            ['example.org/project-gamma', 'example.org/project-alpha'],
+        ];
+
+        $data['Filter by two repositories and one package name'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            ['example.org/project-gamma', 'example.org/project-alpha'],
+            ['vendor/project-alpha'],
+        ];
+
+        $data['Filter by one package name'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            null,
+            ['vendor/project-alpha'],
+        ];
+
+        $data['Filter by two package names'] = [
+            [
+                $packages['alpha'],
+                $packages['alpha-dev'],
+                $packages['eta'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            null,
+            ['vendor/project-alpha', 'vendor/project-eta'],
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     * @param array<string, mixed> $config
+     * @param string[]|null $filterRepos
+     * @param string[]|null $filterPackages
+     */
+    #[DataProvider('dataSelect')]
+    public function testSelect(array $expected, array $config, ?array $filterRepos = null, ?array $filterPackages = null): void
+    {
+        if (null !== $filterRepos || null !== $filterPackages) {
+            // Need to be able to override the default package repository class to allow testing of the filter options.
+            // basically the following needs to work...
+            // $composer->getRepositoryManager()->setRepositoryClass('package', MockPackageSelectionPackageRepository::class);
+            // Simplest solution is probably for the hash in RepositoryFactory::manager() to be moved in to a static property.
+
+            self::markTestIncomplete('Test cannot be completed.');
+        }
+
+        unset(Config::$defaultRepositories['packagist'], Config::$defaultRepositories['packagist.org']);
+
+        $composer = (new Factory())->createComposer(new NullIO(), $config, true, null, false);
+
+        $selection = new PackageSelection(new NullOutput(), 'build', $config, false);
+        $selection->setRepositoriesFilter($filterRepos);
+        $selection->setPackagesFilter([]);
+
+        $selection->select($composer, true);
+
+        $selectionRef = new \ReflectionClass(PackageSelection::class);
+        $selected = $selectionRef->getProperty('selected');
+
+        \sort($expected, \SORT_STRING);
+        self::assertEquals($expected, \array_keys($selected->getValue($selection)));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataFilterRepos(): array
+    {
+        $packages = [
+            'alpha1' => [
+                'name' => 'vendor/project-alpha',
+                'version' => '1.2.3.1',
+                'source' => [
+                    'url' => 'git@github.com:vendor/project-alpha.git',
+                    'type' => 'vcs',
+                    'reference' => '1.2.3.1',
+                ],
+            ],
+            'alpha2' => [
+                'name' => 'vendor/project-alpha',
+                'version' => '1.2.3.2',
+                'source' => [
+                    'url' => 'git@github.com:vendor/project-alpha.git',
+                    'type' => 'vcs',
+                    'reference' => '1.2.3.2',
+                ],
+            ],
+            'beta1' => [
+                'name' => 'vendor/project-beta',
+                'version' => '1.2.3.1',
+                'source' => [
+                    'url' => 'git@github.com:vendor/project-beta.git',
+                    'type' => 'vcs',
+                    'reference' => '1.2.3.1',
+                ],
+            ],
+            'gamma1' => [
+                'name' => 'vendor/project-gamma',
+                'version' => '1.2.3.1',
+                'source' => [
+                    'url' => 'git@github.com:vendor/project-gamma.git',
+                    'type' => 'vcs',
+                    'reference' => '1.2.3.1',
+                ],
+            ],
+        ];
+
+        $repo = [
+            'alpha_packages' => [
+                'type' => 'package',
+                'package' => [
+                    $packages['alpha1'],
+                    $packages['alpha2'],
+                ],
+            ],
+            'beta_packages' => [
+                'type' => 'package',
+                'package' => [
+                    $packages['beta1'],
+                ],
+            ],
+            'gamma_packages' => [
+                'type' => 'package',
+                'package' => [
+                    $packages['gamma1'],
+                ],
+            ],
+        ];
+
+        foreach ($packages as &$p) {
+            $p = $p['name'] . '-' . $p['version'];
+        }
+
+        $data = [];
+
+        $data['Filter by one repository alpha'] = [
+            [
+                $packages['alpha1'],
+                $packages['alpha2'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            ['git@github.com:vendor/project-alpha.git'],
+        ];
+
+        $data['Filter by one repository beta'] = [
+            [
+                $packages['beta1'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            ['git@github.com:vendor/project-beta.git'],
+        ];
+
+        $data['Filter by two repositories'] = [
+            [
+                $packages['alpha1'],
+                $packages['alpha2'],
+                $packages['beta1'],
+            ],
+            [
+                'repositories' => array_values($repo),
+            ],
+            ['git@github.com:vendor/project-beta.git', 'git@github.com:vendor/project-alpha.git'],
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     * @param array<string, mixed> $config
+     * @param string[]|null $filterRepos
+     */
+    #[DataProvider('dataFilterRepos')]
+    public function testFilterRepos(array $expected, array $config, ?array $filterRepos = null): void
+    {
+        unset(Config::$defaultRepositories['packagist'], Config::$defaultRepositories['packagist.org']);
+
+        $composer = (new Factory())->createComposer(new NullIO(), $config, true, null, false);
+
+        $selection = new PackageSelection(new NullOutput(), 'build', $config, false);
+        $selection->setRepositoriesFilter($filterRepos);
+        $selection->setPackagesFilter([]);
+
+        $selection->select($composer, true);
+
+        $selectionRef = new \ReflectionClass(PackageSelection::class);
+        $selected = $selectionRef->getProperty('selected');
+
+        \sort($expected, \SORT_STRING);
+        self::assertEquals($expected, \array_keys($selected->getValue($selection)));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataMetadataSupport(): array
+    {
+        $vendorRepo = new ArrayRepository();
+
+        $vendorRepo->addPackage(new Package('vendor/name', '1.0.0.0', '1.0.0'));
+        $vendorRepo->addPackage(new Package('vendor/name', '1.0.0.0', '1.0.0+metadata-0'));
+        $vendorRepo->addPackage(new Package('vendor/name', '1.0.0.0', '1.0.0+metadata-1'));
+        $vendorRepo->addPackage(new Package('vendor/name', '1.0.0.0', '1.0.0+malformed+metadata'));
+        $vendorRepo->addPackage(new Package('vendor/name', '2.0.0.0', '2.0.0'));
+
+        $data = [];
+
+        $data['packages with metadata'] = [
+            [
+                'vendor/name-1.0.0.0',
+                'vendor/name-1.0.0.0+metadata-0',
+                'vendor/name-1.0.0.0+metadata-1',
+                'vendor/name-2.0.0.0',
+            ],
+            $vendorRepo,
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     */
+    #[DataProvider('dataMetadataSupport')]
+    public function testMetadataSupport(array $expected, ArrayRepository $repository): void
+    {
+        unset(Config::$defaultRepositories['packagist'], Config::$defaultRepositories['packagist.org']);
+
+        $composer = (new Factory())->createComposer(new NullIO(), [], true, null, false);
+        $composer->getRepositoryManager()->addRepository($repository);
+        $selection = new PackageSelection(new NullOutput(), 'build', [], false);
+
+        $selectionRef = new \ReflectionClass(\get_class($selection));
+
+        $select = $selectionRef->getMethod('select');
+        $result = $select->invokeArgs($selection, [$composer, true]);
+
+        self::assertEquals($expected, array_keys($result));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataClean(): array
+    {
+        $packages = [
+            'alpha' => [
+                'dist' => [
+                    'type' => 'zip',
+                    'url' => 'http://127.0.0.1/output/dist/alpha.zip',
+                ],
+                'source' => [
+                    'type' => 'git',
+                    'url' => './git-repo',
+                ],
+            ],
+            'beta' => [
+                'dist' => [
+                    'type' => 'zip',
+                    'url' => 'http://192.168.0.2/output/dist/beta.zip',
+                ],
+                'source' => [
+                    'type' => 'git',
+                    'url' => 'http://localhost/beta.git',
+                ],
+            ],
+            'gamma' => [
+                'dist' => [
+                    'type' => 'zip',
+                    'url' => 'http://192.168.0.1/output/dist/gamma.zip',
+                ],
+                'source' => [
+                    'type' => 'git',
+                    'url' => 'http://192.168.1.1/gamma.git',
+                ],
+            ],
+            'delta' => [
+                'dist' => [
+                    'type' => 'zip',
+                    'url' => 'http://example.org/output/dist/delta.zip',
+                ],
+                'source' => [
+                    'type' => 'git',
+                    'url' => 'http://source.example.org/delta.git',
+                ],
+            ],
+            'epsilon' => [
+                'dist' => [
+                    'type' => 'zip',
+                    'url' => 'http://[abcd::]/output/dist/epsilon.zip',
+                ],
+                'source' => [
+                    'type' => 'git',
+                    'url' => 'http://[::1]/epsilon.git',
+                ],
+            ],
+        ];
+
+        $data = [];
+        $data['Keep everything'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', './git-repo'],
+                'beta' => ['http://192.168.0.2/output/dist/beta.zip', 'http://localhost/beta.git'],
+                'gamma' => ['http://192.168.0.1/output/dist/gamma.zip', 'http://192.168.1.1/gamma.git'],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', 'http://[::1]/epsilon.git'],
+            ],
+            [],
+            $packages,
+        ];
+
+        $data['Remove local file URLs'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', null],
+                'beta' => ['http://192.168.0.2/output/dist/beta.zip', 'http://localhost/beta.git'],
+                'gamma' => ['http://192.168.0.1/output/dist/gamma.zip', 'http://192.168.1.1/gamma.git'],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', 'http://[::1]/epsilon.git'],
+            ],
+            [
+                'strip-hosts' => true,
+            ],
+            $packages,
+        ];
+
+        $data['Remove local IPs'] = [
+            [
+                'beta' => ['http://192.168.0.2/output/dist/beta.zip', null],
+                'gamma' => ['http://192.168.0.1/output/dist/gamma.zip', 'http://192.168.1.1/gamma.git'],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', null],
+            ],
+            [
+                'strip-hosts' => ['/local'],
+            ],
+            $packages,
+        ];
+
+        $data['Remove private IPs'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', null],
+                'beta' => [null, 'http://localhost/beta.git'],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', 'http://[::1]/epsilon.git'],
+            ],
+            [
+                'strip-hosts' => ['/private'],
+            ],
+            $packages,
+        ];
+
+        $data['Remove IPv4 with CIDR notation'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', null],
+                'beta' => [null, 'http://localhost/beta.git'],
+                'gamma' => [null, 'http://192.168.1.1/gamma.git'],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', 'http://[::1]/epsilon.git'],
+            ],
+            [
+                'strip-hosts' => ['192.168.0.0/24'],
+            ],
+            $packages,
+        ];
+
+        $data['Remove IPv6 address'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', null],
+                'beta' => ['http://192.168.0.2/output/dist/beta.zip', 'http://localhost/beta.git'],
+                'gamma' => ['http://192.168.0.1/output/dist/gamma.zip', 'http://192.168.1.1/gamma.git'],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => [null, 'http://[::1]/epsilon.git'],
+            ],
+            [
+                'strip-hosts' => ['abcd::'],
+            ],
+            $packages,
+        ];
+
+        $data['Remove domain'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', null],
+                'beta' => ['http://192.168.0.2/output/dist/beta.zip', 'http://localhost/beta.git'],
+                'gamma' => ['http://192.168.0.1/output/dist/gamma.zip', 'http://192.168.1.1/gamma.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', 'http://[::1]/epsilon.git'],
+            ],
+            [
+                'strip-hosts' => ['example.org'],
+            ],
+            $packages,
+        ];
+
+        $data['Preserve distURL from ArchiveBuilder'] = [
+            [
+                'alpha' => ['http://127.0.0.1/output/dist/alpha.zip', null],
+                'beta' => [null, 'http://localhost/beta.git'],
+                'gamma' => ['http://192.168.0.1/output/dist/gamma.zip', null],
+                'delta' => ['http://example.org/output/dist/delta.zip', 'http://source.example.org/delta.git'],
+                'epsilon' => ['http://[abcd::]/output/dist/epsilon.zip', 'http://[::1]/epsilon.git'],
+            ],
+            [
+                'strip-hosts' => ['/private'],
+                'archive' => [
+                    'directory' => 'dist',
+                    'prefix-url' => 'http://192.168.0.1',
+                ],
+            ],
+            $packages,
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $expected
+     * @param array<string, mixed> $config
+     * @param array<string, mixed> $packages
+     */
+    #[DataProvider('dataClean')]
+    public function testClean(array $expected, array $config, array $packages): void
+    {
+        $selection = new PackageSelection(new NullOutput(), 'build', $config, false);
+        $selectionRef = new \ReflectionClass(\get_class($selection));
+
+        foreach ($packages as $i => $p) {
+            $packages[$i] = new Package($i, '1.0.0.0', '1.0');
+            $packages[$i]->setDistType($p['dist']['type']);
+            $packages[$i]->setDistUrl($p['dist']['url']);
+            $packages[$i]->setSourceType($p['source']['type']);
+            $packages[$i]->setSourceUrl($p['source']['url']);
+        }
+
+        $selected = $selectionRef->getProperty('selected');
+        $selected->setValue($selection, $packages);
+
+        $clean = $selectionRef->getMethod('clean');
+
+        $cleanPackages = $clean->invokeArgs($selection, []);
+        $sources = [];
+        foreach ($cleanPackages as $name => $package) {
+            $sources[$name] = [
+                (null !== $package->getDistType()) ? $package->getDistUrl() : null,
+                (null !== $package->getSourceType()) ? $package->getSourceUrl() : null,
+            ];
+        }
+
+        self::assertEquals($expected, $sources);
+    }
+
+    public static function testOnlyBestCandidates(): void
+    {
+        $repository = new ArrayRepository();
+
+        $packageA0 = new Package('vendor/a', '1.0.0.0', '1.0');
+        $packageA1 = new Package('vendor/a', '1.1.0.0', '1.1');
+        $packageB0 = new Package('vendor/b', '1.0.0.0', '1.0');
+        $packageB1 = new Package('vendor/b', '1.1.0.0', '1.1');
+        $packageB2 = new Package('vendor/b', '1.2.0.0', '1.2');
+        $packageC0 = new Package('vendor/c', '1.0.0.0', '1.0');
+        $packageC1 = new Package('vendor/c', '1.1.0.0', '1.1');
+
+        $constraint1 = new Constraint('=', '1.1');
+        $link1 = new Link('vendor/a', 'vendor/b', $constraint1, Link::TYPE_REQUIRE);
+        $packageA0->setRequires([$link1->getTarget() => $link1]);
+
+        $constraint2 = new Constraint('<=', '1.1');
+        $link2 = new Link('vendor/b', 'vendor/c', $constraint2, Link::TYPE_REQUIRE);
+        $packageB1->setRequires([$link2->getTarget() => $link2]);
+
+        $repository->addPackage($packageA0);
+        $repository->addPackage($packageA1);
+        $repository->addPackage($packageB0);
+        $repository->addPackage($packageB1);
+        $repository->addPackage($packageB2);
+        $repository->addPackage($packageC0);
+        $repository->addPackage($packageC1);
+        $repositorySet = new RepositorySet();
+        $repositorySet->addRepository($repository);
+
+        $rootConstraint = new Constraint('=', '1.0');
+        $rootLink = new Link('top', 'vendor/a', $rootConstraint, Link::TYPE_REQUIRE);
+
+        $config = [
+            'only-best-candidates' => true,
+            'require-dependencies' => true,
+        ];
+        $builder = new PackageSelection(new NullOutput(), 'build', $config, false);
+        $reflection = new \ReflectionClass(get_class($builder));
+        $method = $reflection->getMethod('selectLinks');
+        $method->invokeArgs($builder, [$repositorySet, [$rootLink], false, false]);
+
+        $property = $reflection->getProperty('selected');
+
+        self::assertEquals([$packageA0, $packageB1, $packageC1], array_values($property->getValue($builder)));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public static function dataGetDepReposWithDisableDirectives(): array
+    {
+        $data = [];
+
+        $data['disable directive only'] = [
+            0,
+            [
+                'repositories' => [],
+                'repositories-dep' => [
+                    ['packagist.org' => false],
+                ],
+                'require-all' => true,
+            ],
+        ];
+
+        $data['disable directive with valid repos'] = [
+            1,
+            [
+                'repositories' => [],
+                'repositories-dep' => [
+                    ['packagist.org' => false],
+                    [
+                        'type' => 'package',
+                        'package' => [
+                            'name' => 'vendor/dep-alpha',
+                            'version' => '1.0.0',
+                            'dist' => ['url' => 'https://example.com/alpha.zip', 'type' => 'zip'],
+                        ],
+                    ],
+                ],
+                'require-all' => true,
+            ],
+        ];
+
+        $data['multiple disable directives mixed with valid repos'] = [
+            1,
+            [
+                'repositories' => [],
+                'repositories-dep' => [
+                    ['packagist.org' => false],
+                    ['my-private-repo' => false],
+                    [
+                        'type' => 'package',
+                        'package' => [
+                            'name' => 'vendor/dep-beta',
+                            'version' => '2.0.0',
+                            'dist' => ['url' => 'https://example.com/beta.zip', 'type' => 'zip'],
+                        ],
+                    ],
+                ],
+                'require-all' => true,
+            ],
+        ];
+
+        $data['no disable directives'] = [
+            2,
+            [
+                'repositories' => [],
+                'repositories-dep' => [
+                    [
+                        'type' => 'package',
+                        'package' => [
+                            'name' => 'vendor/dep-alpha',
+                            'version' => '1.0.0',
+                            'dist' => ['url' => 'https://example.com/alpha.zip', 'type' => 'zip'],
+                        ],
+                    ],
+                    [
+                        'type' => 'package',
+                        'package' => [
+                            'name' => 'vendor/dep-beta',
+                            'version' => '2.0.0',
+                            'dist' => ['url' => 'https://example.com/beta.zip', 'type' => 'zip'],
+                        ],
+                    ],
+                ],
+                'require-all' => true,
+            ],
+        ];
+
+        return $data;
+    }
+
+    /**
+     * @param array<string, mixed> $config
+     */
+    #[DataProvider('dataGetDepReposWithDisableDirectives')]
+    public function testGetDepReposSkipsDisableDirectives(int $expectedRepoCount, array $config): void
+    {
+        unset(Config::$defaultRepositories['packagist'], Config::$defaultRepositories['packagist.org']);
+
+        $composer = (new Factory())->createComposer(new NullIO(), $config, true, null, false);
+
+        $selection = new PackageSelection(new NullOutput(), 'build', $config, false);
+
+        $reflection = new \ReflectionClass(PackageSelection::class);
+        $method = $reflection->getMethod('getDepRepos');
+
+        $repos = $method->invokeArgs($selection, [$composer]);
+
+        self::assertCount($expectedRepoCount, $repos);
+
+        foreach ($repos as $repo) {
+            self::assertInstanceOf(\Composer\Repository\RepositoryInterface::class, $repo);
+        }
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function dataSelectWithPackagesFilterOnLocalRepositories(): array
+    {
+        return [
+            'artifact repository' => [self::REPOSITORY_TYPE_ARTIFACT, 'vendor/artifact-package'],
+            'path repository' => [self::REPOSITORY_TYPE_PATH, 'vendor/path-package'],
+            'package repository' => [self::REPOSITORY_TYPE_PACKAGE, 'vendor/inline-package'],
+        ];
+    }
+
+    /**
+     * A partial update (`satis build satis.json web/ vendor/package`) must keep
+     * repositories Satis can read without any network access, even though those
+     * repositories carry no "name" in their config.
+     *
+     * @see https://github.com/composer/satis/issues/983
+     */
+    #[DataProvider('dataSelectWithPackagesFilterOnLocalRepositories')]
+    public function testSelectWithPackagesFilterKeepsLocalRepositories(string $repositoryType, string $packageName): void
+    {
+        $this->runPackagesFilterSelection(
+            fn (string $workDir): array => [$this->createLocalRepositoryConfig($repositoryType, $packageName, $workDir)],
+            [$packageName],
+            [$packageName]
+        );
+    }
+
+    /**
+     * The filter must still filter: a local repository that does not hold any of
+     * the requested packages has to be dropped like any other.
+     *
+     * @see https://github.com/composer/satis/issues/983
+     */
+    public function testSelectWithPackagesFilterDropsLocalRepositoriesWithoutTheFilteredPackage(): void
+    {
+        $wantedPackage = 'vendor/wanted-package';
+        $otherPackage = 'vendor/other-package';
+
+        $this->runPackagesFilterSelection(
+            fn (string $workDir): array => [
+                $this->createLocalRepositoryConfig(self::REPOSITORY_TYPE_ARTIFACT, $wantedPackage, $workDir),
+                $this->createLocalRepositoryConfig(self::REPOSITORY_TYPE_ARTIFACT, $otherPackage, $workDir),
+            ],
+            [$wantedPackage],
+            [$wantedPackage]
+        );
+    }
+
+    /**
+     * Regression guard for the pre-existing behaviour: a repository declaring a
+     * matching "name" in its Satis config is still selected through that name.
+     * This one already passes without the local-repository matching.
+     */
+    public function testSelectWithPackagesFilterStillMatchesTheRepositoryConfigName(): void
+    {
+        $packageName = 'vendor/named-package';
+
+        $this->runPackagesFilterSelection(
+            function (string $workDir) use ($packageName): array {
+                $repository = $this->createLocalRepositoryConfig(self::REPOSITORY_TYPE_ARTIFACT, $packageName, $workDir);
+                $repository['name'] = $packageName;
+
+                return [$repository];
+            },
+            [$packageName],
+            [$packageName]
+        );
+    }
+
+    /**
+     * `require-dependencies` resolves through the repositories the filter dropped.
+     *
+     * @see https://github.com/composer/satis/issues/706
+     */
+    public function testSelectWithPackagesFilterStillResolvesDependencies(): void
+    {
+        $filteredPackage = 'vendor/filtered-package';
+        $dependency = 'vendor/dependency-package';
+
+        $this->runPackagesFilterSelection(
+            fn (string $workDir): array => [
+                $this->createLocalRepositoryConfig(
+                    self::REPOSITORY_TYPE_PACKAGE,
+                    $filteredPackage,
+                    $workDir,
+                    [$dependency => self::FIXTURE_VERSION]
+                ),
+                $this->createLocalRepositoryConfig(self::REPOSITORY_TYPE_PACKAGE, $dependency, $workDir),
+            ],
+            [$filteredPackage],
+            [$dependency, $filteredPackage],
+            ['require-dependencies' => true]
+        );
+    }
+
+    /**
+     * Runs `select()` with a packages filter over a throwaway working directory
+     * and asserts which packages came out.
+     *
+     * @param callable(string): list<array<string, mixed>> $buildRepositories
+     * @param list<string> $packagesFilter
+     * @param list<string> $expectedPackageNames
+     * @param array<string, mixed> $extraConfig
+     */
+    private function runPackagesFilterSelection(
+        callable $buildRepositories,
+        array $packagesFilter,
+        array $expectedPackageNames,
+        array $extraConfig = [],
+    ): void {
+        $filesystem = new Filesystem();
+        $workDir = sys_get_temp_dir() . '/satis-package-filter-' . uniqid('', true);
+        $filesystem->ensureDirectoryExists($workDir);
+
+        try {
+            $config = $extraConfig + [
+                'name' => 'test/satis',
+                'homepage' => 'http://localhost',
+                'repositories' => $buildRepositories($workDir),
+                'require-all' => true,
+            ];
+
+            unset(Config::$defaultRepositories['packagist'], Config::$defaultRepositories['packagist.org']);
+
+            $composer = (new Factory())->createComposer(new NullIO(), $config, true, null, false);
+
+            $selection = new PackageSelection(new NullOutput(), $workDir . '/build', $config, false);
+            $selection->setPackagesFilter($packagesFilter);
+
+            $selected = $selection->select($composer, false);
+
+            $expected = array_map(
+                static fn (string $name): string => $name . '-' . self::FIXTURE_NORMALIZED_VERSION,
+                $expectedPackageNames
+            );
+            self::assertSame($expected, array_keys($selected));
+        } finally {
+            $filesystem->removeDirectory($workDir);
+        }
+    }
+
+    /**
+     * Builds the repository fixture on disk and returns its Satis config entry.
+     *
+     * @param array<string, string> $requires
+     *
+     * @return array<string, mixed>
+     */
+    private function createLocalRepositoryConfig(
+        string $repositoryType,
+        string $packageName,
+        string $workDir,
+        array $requires = [],
+    ): array {
+        $manifest = ['name' => $packageName, 'version' => self::FIXTURE_VERSION];
+
+        if ([] !== $requires) {
+            $manifest['require'] = $requires;
+        }
+
+        $composerJson = json_encode($manifest, \JSON_THROW_ON_ERROR);
+
+        if (self::REPOSITORY_TYPE_PACKAGE === $repositoryType) {
+            return [
+                'type' => self::REPOSITORY_TYPE_PACKAGE,
+                'package' => $manifest,
+            ];
+        }
+
+        $filesystem = new Filesystem();
+        // One directory per package: an `artifact` repository is a directory, so
+        // two of them must not end up sharing one.
+        $repositoryDir = sprintf('%s/%s/%s', $workDir, $repositoryType, str_replace('/', '-', $packageName));
+        $filesystem->ensureDirectoryExists($repositoryDir);
+
+        if (self::REPOSITORY_TYPE_PATH === $repositoryType) {
+            if (false === file_put_contents($repositoryDir . '/composer.json', $composerJson)) {
+                self::fail('Could not write the path repository fixture in ' . $repositoryDir);
+            }
+
+            return ['type' => self::REPOSITORY_TYPE_PATH, 'url' => $repositoryDir];
+        }
+
+        $archivePath = sprintf(
+            '%s/%s-%s.zip',
+            $repositoryDir,
+            str_replace('/', '-', $packageName),
+            self::FIXTURE_VERSION
+        );
+        $archive = new \ZipArchive();
+        if (true !== $archive->open($archivePath, \ZipArchive::CREATE)) {
+            self::fail('Could not create the artifact repository fixture ' . $archivePath);
+        }
+
+        try {
+            $archive->addFromString('composer.json', $composerJson);
+        } finally {
+            $archive->close();
+        }
+
+        return ['type' => self::REPOSITORY_TYPE_ARTIFACT, 'url' => $repositoryDir];
+    }
+}
+
+final class MockPackageSelectionPackageRepository extends PackageRepository implements ConfigurableRepositoryInterface
+{
+    /** @var string */
+    private $name;
+
+    /** @var string */
+    private $url;
+
+    /*
+     * Constructor.
+     *
+     * @param array{package: mixed[], url?: string} $config package definition
+     */
+    public function __construct(array $config)
+    {
+        $this->name = $config['package']['name'] ?? $config['package'][0]['name'];
+        $configWithUrl = array_merge(['url' => ''], $config);
+        $this->url = $configWithUrl['url'];
+
+        parent::__construct($config);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function getRepoConfig(): array
+    {
+        return ['name' => $this->name, 'url' => $this->url];
+    }
+}
